@@ -23,7 +23,7 @@ struct CacheDept {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 struct Cache {
-    pub inner: HashMap<u8, HashMap<String, CacheDept>>,
+    pub inner: HashMap<u8 /* Series */, HashMap<String /* Dept */, CacheDept>>,
     pub days: SystemTime,
     pub holidays: SystemTime,
     pub central_notices: SystemTime,
@@ -67,7 +67,7 @@ fn main() -> Result<()> {
     for series_dir in read_dir("data")? {
         let series_dir = series_dir?;
         if !series_dir.metadata()?.is_dir() {
-            continue;
+            continue; // To next entry (possibly a series)
         }
         let series_dir_name = series_dir.file_name();
         let series = u8::from_str(series_dir_name.to_str().unwrap())?;
@@ -84,69 +84,64 @@ fn main() -> Result<()> {
                 continue;
             }
             semester_path.push("semester.yaml");
-            if semester_path.exists() {
-                let (local_notices_time, local_notices) = match File::open({
-                    let mut path = dir.path().clone();
-                    path.push("notices.yaml");
-                    path
-                }) {
-                    Ok(file) => (
-                        Some(file.metadata()?.modified()?),
-                        Some(yaml::from_reader::<_, Vec<Notice>>(file)?),
-                    ),
-                    Err(_) => (None, None),
-                };
-                let dept = dir.file_name().to_str().unwrap().to_owned();
-                let semester_time = metadata(&semester_path)?.modified()?;
-                match series_cache.entry(dept) {
-                    Entry::Occupied(entry) => {
-                        if entry.get().semester == semester_time
-                            && entry.get().notices == local_notices_time
-                            && cache.days == days_map_time
-                            && cache.holidays == holidays_time
-                            && cache.central_notices == central_notices_time
-                        {
-                            continue;
-                        }
-                    }
-                    Entry::Vacant(entry) => {
-                        entry.insert(CacheDept {
-                            semester: semester_time,
-                            notices: local_notices_time,
-                        });
+            if !semester_path.exists() {
+                let mut parent_dates_map_path = dir.path().parent().unwrap().to_path_buf();
+                parent_dates_map_path.push("dates_map.yaml");
+                if parent_dates_map_path.exists() {
+                    let mut self_dates_map_path = dir.path().clone();
+                    self_dates_map_path.push("dates_map.yaml");
+                    copy(parent_dates_map_path, self_dates_map_path)?;
+                }
+
+                continue;
+            }
+
+            let (local_notices_time, local_notices) = match File::open({
+                let mut path = dir.path().clone();
+                path.push("notices.yaml");
+                path
+            }) {
+                Ok(file) => (
+                    Some(file.metadata()?.modified()?),
+                    Some(yaml::from_reader::<_, Vec<Notice>>(file)?),
+                ),
+                Err(_) => (None, None),
+            };
+            let dept = dir.file_name().to_str().unwrap().to_owned();
+            let semester_time = metadata(&semester_path)?.modified()?;
+            match series_cache.entry(dept) {
+                Entry::Occupied(entry) => {
+                    if entry.get().semester == semester_time
+                        && entry.get().notices == local_notices_time
+                        && cache.days == days_map_time
+                        && cache.holidays == holidays_time
+                        && cache.central_notices == central_notices_time
+                    {
+                        continue;
                     }
                 }
-                let start_date: NaiveDate = yaml::from_slice(&read(semester_path)?)?;
-                /*
-                let stringed = yaml::to_string(&get_dates_mapped(
+                Entry::Vacant(entry) => {
+                    entry.insert(CacheDept {
+                        semester: semester_time,
+                        notices: local_notices_time,
+                    });
+                }
+            }
+            let start_date: NaiveDate = yaml::from_slice(&read(semester_path)?)?;
+            yaml::to_writer(
+                File::create({
+                    let mut path = dir.path().clone();
+                    path.push("dates_map.yaml");
+                    path
+                })?,
+                &get_dates_mapped(
                     &days_map,
                     &holidays,
                     &central_notices,
+                    &local_notices,
                     start_date,
-                )?)?;
-                write(
-                    {
-                        let mut path = dir.path().clone();
-                        path.push("dates_map.yaml");
-                        path
-                    },
-                    &stringed,
-                )?;*/
-                yaml::to_writer(
-                    File::create({
-                        let mut path = dir.path().clone();
-                        path.push("dates_map.yaml");
-                        path
-                    })?,
-                    &get_dates_mapped(
-                        &days_map,
-                        &holidays,
-                        &central_notices,
-                        &local_notices,
-                        start_date,
-                    )?,
-                )?;
-            }
+                )?,
+            )?;
         }
     }
 
@@ -169,23 +164,26 @@ fn get_dates_mapped(
 
     let (date, day) = days_map.first_key_value().unwrap();
     let (mut date, mut day) = (date.succ(), *day);
-    let first_assigned_date = date.clone();
+    let first_assigned_date = date;
     let _s_first_assigned_date = first_assigned_date.to_string();
 
     let mut holidays = holidays
         .iter()
-        .map(|holiday| holiday.start..=holiday.end)
-        .filter(|range| &first_assigned_date < range.start());
+        .filter(|holiday| first_assigned_date < holiday.span.start())
+        .peekable();
 
-    let mut day_offs = notices.iter().filter_map(|notice| match notice {
-        Notice::ClassOff {
-            day_off: true,
-            date,
-            time: TimeScope::AllDay(end_date),
-            ..
-        } if &first_assigned_date < date => Some((date, end_date)),
-        _ => None,
-    });
+    let mut day_offs = notices
+        .iter()
+        .filter_map(|notice| match notice {
+            Notice::ClassOff {
+                day_off: true,
+                date,
+                time: TimeScope::AllDay(end_date),
+                ..
+            } if &first_assigned_date < date => Some((date, end_date)),
+            _ => None,
+        })
+        .peekable();
 
     let mut local_day_offs = local_notices
         .iter()
@@ -203,11 +201,9 @@ fn get_dates_mapped(
                 Some((date, Some(*date + chrono::Duration::days(4))))
             }
             _ => None,
-        });
+        })
+        .peekable();
 
-    let mut upcoming_holidays = holidays.next();
-    let mut upcoming_day_offs = day_offs.next();
-    let mut upcoming_local_day_offs = local_day_offs.next();
     let mut cycle = 1;
     let mut days = 0;
     let mut dates_map = BTreeMap::<NaiveDate, (Day, u32)>::new();
@@ -215,29 +211,39 @@ fn get_dates_mapped(
         let _date_as_str = date.to_string();
         match days_map.get(&date) {
             None => {
-                if let Some(ref current_holidays) = upcoming_holidays {
-                    if current_holidays.contains(&date) {
-                        date = current_holidays.end().succ();
-                        upcoming_holidays = holidays.next();
+                if let Some(current_holidays) = holidays.peek() {
+                    if current_holidays.span.contains(date) {
+                        date = current_holidays.span.end().succ();
+                        holidays.next();
+                        while let Some(possible_holidays) = holidays.peek() {
+                            if possible_holidays.span.end() < date {
+                                holidays.next();
+                            } else {
+                                break;
+                            }
+                        }
                         continue;
                     }
+                    if current_holidays.span.end() < date {
+                        holidays.next();
+                    }
                 }
-                if let Some(ref current_day_offs) = upcoming_day_offs {
+                if let Some(ref current_day_offs) = day_offs.peek() {
                     if let Some(end_date) = current_day_offs.1 {
                         if &date >= current_day_offs.0 && &date <= end_date {
                             date = end_date.succ();
-                            upcoming_day_offs = day_offs.next();
+                            day_offs.next();
                             continue;
                         }
                     } else {
                         break;
                     }
                 }
-                if let Some(ref current_local_day_offs) = upcoming_local_day_offs {
+                if let Some(ref current_local_day_offs) = local_day_offs.peek() {
                     if let Some(end_date) = current_local_day_offs.1 {
                         if &date >= current_local_day_offs.0 && date <= end_date {
                             date = end_date.succ();
-                            upcoming_local_day_offs = local_day_offs.next();
+                            local_day_offs.next();
                             continue;
                         }
                     } else {
