@@ -29,7 +29,7 @@ struct Cache {
     pub central_notices: SystemTime,
 }
 
-fn main() -> BoxResult<()> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (days_map_time, days_map) = match File::open("data/days.yaml") {
         Ok(file) => (
             file.metadata()?.modified()?,
